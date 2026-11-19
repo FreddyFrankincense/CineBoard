@@ -1,0 +1,6 @@
+{
+  "name": "CineBoard Studio",
+  "description": "Screenplay-to-storyboard studio that parses script scenes into shot breakdowns and generates visual storyboard panels using Gemini AI.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
