@@ -10,6 +10,12 @@ export interface SceneComposition {
   subjectGridZone?: 'left_third' | 'center' | 'right_third' | 'foreground_left' | 'foreground_right';
   subjectMotionDirection?: 'none' | 'left_to_right' | 'right_to_left' | 'toward_camera' | 'away_from_camera';
   cameraMotionVector?: 'static' | 'push_in' | 'pull_out' | 'pan_left' | 'pan_right' | 'tilt_up' | 'tilt_down' | 'track_lateral';
+  subjectLabel?: string; // Primary character name from screenplay (e.g. "VANCE")
+  secondarySubjectLabel?: string; // Secondary character in scene/shot (e.g. "ELENA")
+  secondarySubjectZone?: 'none' | 'left_third' | 'center' | 'right_third' | 'foreground_ots_left' | 'foreground_ots_right';
+  depthArrangement?: 'single_midground' | 'fg_to_mg_conversational' | 'mg_to_bg_deep_focus' | 'lateral_two_shot';
+  axis180Line?: boolean; // Show 180-degree line of action & top-down floor plan inset
+  cameraSideOfAxis?: 'A_SIDE_NORMAL' | 'B_SIDE_REVERSE';
 }
 
 export interface StoryboardPanel {
@@ -17,6 +23,7 @@ export interface StoryboardPanel {
   panelNumber: number;
   title: string;
   sceneSlugline: string;
+  sceneNumber?: string;
   shotSize: string;
   cameraAngle: string;
   cameraMovement: string;

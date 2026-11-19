@@ -395,16 +395,457 @@ export async function importFadeInFile(file: File): Promise<ParsedFadeInDocument
     }
   }
 
-  // Decode as UTF-8 text (handles standalone document.xml, .osf, .fdx, .fountain, .txt)
-  const textContent = new TextDecoder('utf-8').decode(arrayBuffer);
-  if (textContent.trim().startsWith('<')) {
-    const parsed = parseFadeInXml(textContent, baseTitle);
+  // Decode as UTF-8 text (handles standalone document.xml, .osf, .fdx, .json, .fountain, .txt)
+  const textContent = new TextDecoder('utf-8').decode(arrayBuffer).replace(/^\uFEFF/, '');
+  const trimmedText = textContent.trim();
+
+  // Support importing exported CineBoard JSON project files directly
+  if (trimmedText.startsWith('{') || fileName.toLowerCase().endsWith('.json')) {
+    try {
+      const jsonObj = JSON.parse(trimmedText);
+      if (Array.isArray(jsonObj.scriptElements) && jsonObj.scriptElements.length > 0) {
+        return {
+          title: jsonObj.projectTitle || baseTitle,
+          sourceFormat: 'fadein-xml',
+          elements: jsonObj.scriptElements,
+          rawText: jsonObj.scriptText || elementsToFormattedScriptText(jsonObj.scriptElements),
+        };
+      }
+      if (typeof jsonObj.scriptText === 'string' && jsonObj.scriptText.trim()) {
+        return parsePlainScriptToElements(jsonObj.scriptText, jsonObj.projectTitle || baseTitle);
+      }
+    } catch {
+      // Not a JSON project file; continue to XML / plain text parsing
+    }
+  }
+
+  if (trimmedText.startsWith('<')) {
+    const parsed = parseFadeInXml(trimmedText, baseTitle);
     if (parsed.elements.length > 0) {
       return parsed;
     }
   }
 
   return parsePlainScriptToElements(textContent, baseTitle);
+}
+
+export interface ParsedSceneSummary {
+  sceneIndex: number;
+  sceneNumber: string;
+  slugline: string;
+  elementCount: number;
+  charactersInScene: string[];
+  elements: ScreenplayElement[];
+}
+
+/**
+ * Groups parsed Fade In ScreenplayElements by Scene Heading so the user can inspect
+ * or generate technical storyboards for any specific scene or the entire draft.
+ */
+export function extractScenesFromElements(elements: ScreenplayElement[]): ParsedSceneSummary[] {
+  const scenes: ParsedSceneSummary[] = [];
+  let current: ParsedSceneSummary | null = null;
+
+  const cleanCharName = (raw: string) =>
+    raw
+      .replace(/\s*\([^)]*\)/g, '')
+      .trim()
+      .toUpperCase();
+
+  for (const el of elements) {
+    if (el.type === 'scene_heading') {
+      if (current) {
+        scenes.push(current);
+      }
+      const nextIdx = scenes.length + 1;
+      current = {
+        sceneIndex: nextIdx,
+        sceneNumber: el.sceneNumber || String(nextIdx),
+        slugline: el.text.toUpperCase(),
+        elementCount: 1,
+        charactersInScene: [],
+        elements: [el],
+      };
+    } else {
+      if (!current) {
+        current = {
+          sceneIndex: 1,
+          sceneNumber: '1',
+          slugline: 'INT. OPENING SCENE - DAY',
+          elementCount: 0,
+          charactersInScene: [],
+          elements: [],
+        };
+      }
+      current.elementCount += 1;
+      current.elements.push(el);
+      if (el.type === 'character') {
+        const cName = cleanCharName(el.text);
+        if (cName && !current.charactersInScene.includes(cName)) {
+          current.charactersInScene.push(cName);
+        }
+      }
+    }
+  }
+
+  if (current && current.elements.length > 0) {
+    scenes.push(current);
+  }
+
+  return scenes;
+}
+
+/**
+ * Generates an immediate deterministic set of technical storyboard panels directly from
+ * the parsed Fade In ScreenplayElements (Scene Headings, Action, Character Cues, Dialogue)
+ * using real character names, 180-degree conversational shot/reverse-shot rules, and
+ * spatial movement cues from the screenplay data.
+ */
+export function buildInstantPanelsFromElements(
+  elements: ScreenplayElement[],
+  maxPanels = 12,
+  filterSceneSlugline?: string
+): Array<{
+  id: string;
+  panelNumber: number;
+  title: string;
+  sceneSlugline: string;
+  sceneNumber?: string;
+  shotSize: string;
+  cameraAngle: string;
+  cameraMovement: string;
+  lensFocalLength: string;
+  durationSeconds: number;
+  actionNotes: string;
+  dialogueSnippet: string;
+  blockingNotes: string;
+  visualPrompt: string;
+  sceneComposition: {
+    environmentType: string;
+    primarySubject: string;
+    timeOfDay: string;
+    primaryColorHex: string;
+    secondaryColorHex: string;
+    highlightColorHex: string;
+    vanishingPointX: number;
+    vanishingPointY: number;
+    subjectGridZone: 'left_third' | 'center' | 'right_third';
+    subjectMotionDirection: 'none' | 'left_to_right' | 'right_to_left';
+    cameraMotionVector: 'static' | 'push_in' | 'pull_out' | 'pan_right' | 'track_lateral';
+    subjectLabel: string;
+    secondarySubjectLabel: string;
+    secondarySubjectZone: 'none' | 'left_third' | 'center' | 'right_third' | 'foreground_ots_left' | 'foreground_ots_right';
+    depthArrangement: 'single_midground' | 'fg_to_mg_conversational' | 'mg_to_bg_deep_focus' | 'lateral_two_shot';
+    axis180Line: boolean;
+    cameraSideOfAxis: 'A_SIDE_NORMAL' | 'B_SIDE_REVERSE';
+  };
+}> {
+  const allScenes = extractScenesFromElements(elements);
+  const targetScenes =
+    filterSceneSlugline && filterSceneSlugline !== 'ALL'
+      ? allScenes.filter(
+          (s) => s.slugline.trim().toUpperCase() === filterSceneSlugline.trim().toUpperCase()
+        )
+      : allScenes;
+
+  const activeElements =
+    targetScenes.length > 0
+      ? targetScenes.flatMap((s) => s.elements)
+      : elements;
+
+  const panels: ReturnType<typeof buildInstantPanelsFromElements> = [];
+  let currentSlugline = 'INT. SCENE - DAY';
+  let currentSceneNumber = '1';
+  let currentSceneRoster: string[] = [];
+  let sceneBeatCount = 0;
+
+  let currentAction: string[] = [];
+  let currentCharacter = '';
+  let currentParen = '';
+  let currentDialogue: string[] = [];
+
+  const cleanCharName = (raw: string) =>
+    raw
+      .replace(/\s*\([^)]*\)/g, '')
+      .trim()
+      .toUpperCase();
+
+  // Extract capitalized ALL-CAPS character names introduced in Action paragraphs (e.g. "COLE VANCE (40s)")
+  const extractCapsNameFromAction = (text: string): string => {
+    const m = text.match(/\b([A-Z]{2,}(?:\s+[A-Z]{2,})?)\s*\(\d+/);
+    if (m) return m[1].trim();
+    return '';
+  };
+
+  const flushBeat = () => {
+    if (currentAction.length === 0 && currentDialogue.length === 0) return;
+    if (panels.length >= maxPanels) return;
+
+    const idx = panels.length;
+    sceneBeatCount += 1;
+
+    const actionText =
+      currentAction.join(' ').trim() ||
+      (currentCharacter
+        ? `${currentCharacter} delivers dialogue in ${currentSlugline}.`
+        : 'Establishing spatial layout and room geometry.');
+
+    const dialogueText =
+      currentCharacter && currentDialogue.length > 0
+        ? `${currentCharacter}${currentParen ? ' ' + currentParen : ''}: "${currentDialogue.join(' ').trim()}"`
+        : 'No dialogue — ambient audio only';
+
+    const upperAction = actionText.toUpperCase();
+    const upperSlug = currentSlugline.toUpperCase();
+
+    // Identify Primary & Secondary Character names in this shot
+    const speakerBase = currentCharacter ? cleanCharName(currentCharacter) : '';
+    const actionIntroducedName = extractCapsNameFromAction(actionText);
+    if (actionIntroducedName && !currentSceneRoster.includes(actionIntroducedName)) {
+      currentSceneRoster.push(actionIntroducedName);
+    }
+    if (speakerBase && !currentSceneRoster.includes(speakerBase)) {
+      currentSceneRoster.push(speakerBase);
+    }
+
+    const primaryLabel =
+      speakerBase ||
+      actionIntroducedName ||
+      currentSceneRoster[0] ||
+      'SUBJ A';
+
+    const otherCharacters = currentSceneRoster.filter((c) => c !== primaryLabel);
+    const secondaryLabel = otherCharacters[0] || '';
+
+    // Determine Shot Size & Coverage Mechanics:
+    // Beat 1 of a scene defaults to an Establishing Wide / Medium Wide Shot unless an explicit Close-Up is written.
+    // Subsequent dialogue beats alternate cleanly along the 180-degree axis (OTS / Medium Close-Up shot/reverse-shot).
+    const explicitECU = upperAction.includes('EXTREME CLOSE') || upperAction.includes('ECU') || upperAction.includes('INSERT');
+    const explicitCU = !explicitECU && (upperAction.includes('CLOSE-UP') || upperAction.includes('CLOSE UP'));
+    const explicitWide = upperAction.includes('WIDE SHOT') || upperAction.includes('ESTABLISH');
+
+    const isConversationalExchange = Boolean(speakerBase && secondaryLabel);
+
+    let shotSize = 'Medium Shot';
+    if (explicitECU) {
+      shotSize = 'Extreme Close-Up';
+    } else if (explicitCU) {
+      shotSize = 'Close-Up';
+    } else if (sceneBeatCount === 1 || explicitWide) {
+      shotSize = upperSlug.startsWith('EXT.') ? 'Wide Shot' : 'Medium Wide Shot';
+    } else if (isConversationalExchange) {
+      shotSize = 'Medium Close-Up';
+    } else if (currentDialogue.length > 0) {
+      shotSize = 'Medium Close-Up';
+    }
+
+    // Camera Elevation Angle from Action / Slugline cues
+    let cameraAngle = 'Eye Level';
+    if (
+      upperAction.includes('OVERHEAD') ||
+      upperAction.includes('TOP-DOWN') ||
+      upperAction.includes('TOP DOWN') ||
+      upperAction.includes('BIRD')
+    ) {
+      cameraAngle = "Overhead Bird's-Eye";
+    } else if (
+      upperAction.includes('LOW ANGLE') ||
+      upperAction.includes('LOOKING UP') ||
+      upperAction.includes('LEAP') ||
+      upperAction.includes('ROOFTOP')
+    ) {
+      cameraAngle = 'Low Angle';
+    } else if (
+      upperAction.includes('HIGH ANGLE') ||
+      upperAction.includes('LOOKING DOWN') ||
+      upperAction.includes('BALCONY')
+    ) {
+      cameraAngle = 'High Angle';
+    } else if (isConversationalExchange && sceneBeatCount > 1) {
+      cameraAngle = 'Over-the-Shoulder';
+    }
+
+    // 180-Degree Axis Rule Placement:
+    // Character 1 in scene roster stays on Left Third looking Right;
+    // Character 2 in scene roster stays on Right Third looking Left.
+    const rosterIndex = currentSceneRoster.indexOf(primaryLabel);
+    const isSecondSpeaker = rosterIndex === 1;
+
+    const subjectGridZone: 'left_third' | 'center' | 'right_third' =
+      sceneBeatCount === 1 && !isConversationalExchange
+        ? 'center'
+        : isSecondSpeaker
+        ? 'right_third'
+        : 'left_third';
+
+    const subjectMotionDirection: 'none' | 'left_to_right' | 'right_to_left' =
+      isSecondSpeaker ? 'right_to_left' : 'left_to_right';
+
+    let secondarySubjectZone: 'none' | 'left_third' | 'center' | 'right_third' | 'foreground_ots_left' | 'foreground_ots_right' =
+      'none';
+    let depthArrangement: 'single_midground' | 'fg_to_mg_conversational' | 'mg_to_bg_deep_focus' | 'lateral_two_shot' =
+      'single_midground';
+
+    if (secondaryLabel) {
+      if (cameraAngle === 'Over-the-Shoulder') {
+        secondarySubjectZone = isSecondSpeaker ? 'foreground_ots_left' : 'foreground_ots_right';
+        depthArrangement = 'fg_to_mg_conversational';
+      } else if (shotSize.includes('Wide') || shotSize === 'Medium Shot') {
+        secondarySubjectZone = isSecondSpeaker ? 'left_third' : 'right_third';
+        depthArrangement = 'lateral_two_shot';
+      }
+    }
+
+    // Camera Movement Vector from Action Verbs
+    let cameraMovement = 'Static Lock-off';
+    if (
+      upperAction.includes('PUSH') ||
+      upperAction.includes('LEAN') ||
+      upperAction.includes('APPROACH') ||
+      upperAction.includes('STEP')
+    ) {
+      cameraMovement = 'Slow Push In';
+    } else if (
+      upperAction.includes('PULL') ||
+      upperAction.includes('RETREAT') ||
+      upperAction.includes('EXIT')
+    ) {
+      cameraMovement = 'Pull Back / Zoom Out';
+    } else if (
+      upperAction.includes('SPRINT') ||
+      upperAction.includes('RUN') ||
+      upperAction.includes('WALK') ||
+      upperAction.includes('FOLLOW') ||
+      upperAction.includes('CABLE')
+    ) {
+      cameraMovement = 'Tracking / Dolly Lateral';
+    } else if (
+      upperAction.includes('PAN') ||
+      upperAction.includes('ACROSS') ||
+      upperAction.includes('PASS')
+    ) {
+      cameraMovement = 'Pan Left / Right';
+    }
+
+    const lensFocalLength = explicitECU
+      ? '85mm Medium Telephoto'
+      : shotSize.includes('Close')
+      ? '50mm Normal'
+      : shotSize.includes('Wide')
+      ? '24mm Wide'
+      : '35mm Standard Wide';
+
+    const camVectorMap: Record<string, 'static' | 'push_in' | 'pull_out' | 'pan_right' | 'track_lateral'> = {
+      'Slow Push In': 'push_in',
+      'Pull Back / Zoom Out': 'pull_out',
+      'Tracking / Dolly Lateral': 'track_lateral',
+      'Pan Left / Right': 'pan_right',
+      'Static Lock-off': 'static',
+    };
+
+    // Estimate realistic shot timing from action + spoken word count (~2.5 words/sec for dialogue)
+    const dialogueWords = currentDialogue.join(' ').split(/\s+/).filter(Boolean).length;
+    const actionWords = actionText.split(/\s+/).filter(Boolean).length;
+    const estimatedSeconds = Number(
+      Math.min(12, Math.max(2.5, 2.0 + dialogueWords * 0.38 + actionWords * 0.08)).toFixed(1)
+    );
+
+    const shortLocation = currentSlugline
+      .replace(/^(INT\.|EXT\.|INT\/EXT\.|I\/E\.)\s*/i, '')
+      .split(/[-–—]/)[0]
+      .trim()
+      .split(/\s+/)
+      .slice(0, 2)
+      .join(' ');
+
+    const coverageTag =
+      sceneBeatCount === 1
+        ? 'Establishing'
+        : cameraAngle === 'Over-the-Shoulder'
+        ? `OTS on ${primaryLabel}`
+        : `${primaryLabel} ${shotSize.replace(' Shot', '')}`;
+
+    panels.push({
+      id: `panel-${Date.now()}-${idx + 1}`,
+      panelNumber: idx + 1,
+      title: `${shortLocation || 'Scene'} — ${coverageTag}`,
+      sceneSlugline: currentSlugline,
+      sceneNumber: currentSceneNumber,
+      shotSize,
+      cameraAngle,
+      cameraMovement,
+      lensFocalLength,
+      durationSeconds: estimatedSeconds,
+      actionNotes: actionText.slice(0, 280),
+      dialogueSnippet: dialogueText.slice(0, 260),
+      blockingNotes: `${
+        secondaryLabel
+          ? `180° Axis between ${primaryLabel} (${subjectGridZone.replace('_', ' ')}) & ${secondaryLabel} (${secondarySubjectZone.replace(/_/g, ' ')})`
+          : `Single subject ${primaryLabel} on ${subjectGridZone.replace('_', ' ')} axis`
+      }. Horizon ${
+        cameraAngle === 'Low Angle' ? '70%' : cameraAngle === 'High Angle' ? '28%' : '48%'
+      }; Cam Vector: ${cameraMovement}.`,
+      visualPrompt: `Technical monochrome line-art storyboard schematic for ${currentSlugline}: ${shotSize}, ${cameraAngle}, primary mannequin ${primaryLabel} on ${subjectGridZone.replace('_', ' ')}${
+        secondaryLabel ? `, secondary mannequin ${secondaryLabel} on ${secondarySubjectZone.replace(/_/g, ' ')}` : ''
+      }, 1-point perspective grid, camera ${cameraMovement} vector arrows.`,
+      sceneComposition: {
+        environmentType: upperSlug.startsWith('EXT.') ? 'urban_alley' : 'interior_room',
+        primarySubject: secondaryLabel ? 'two_characters' : isConversationalExchange ? 'close_portrait' : 'standing_figure',
+        timeOfDay: upperSlug.includes('NIGHT') ? 'night' : 'day',
+        primaryColorHex: '#101216',
+        secondaryColorHex: '#181B20',
+        highlightColorHex: '#38BDF8',
+        vanishingPointX: isSecondSpeaker ? 44 : 56,
+        vanishingPointY: cameraAngle === 'Low Angle' ? 70 : cameraAngle === 'High Angle' ? 28 : 48,
+        subjectGridZone,
+        subjectMotionDirection,
+        cameraMotionVector: camVectorMap[cameraMovement] || 'static',
+        subjectLabel: primaryLabel,
+        secondarySubjectLabel: secondaryLabel,
+        secondarySubjectZone,
+        depthArrangement,
+        axis180Line: true,
+        cameraSideOfAxis: 'A_SIDE_NORMAL',
+      },
+    });
+
+    currentAction = [];
+    currentCharacter = '';
+    currentParen = '';
+    currentDialogue = [];
+  };
+
+  for (const el of activeElements) {
+    if (panels.length >= maxPanels) break;
+    if (el.type === 'scene_heading') {
+      flushBeat();
+      currentSlugline = el.text.toUpperCase();
+      currentSceneNumber = el.sceneNumber || String(panels.length + 1);
+      const matchingScene = allScenes.find(
+        (s) => s.slugline.trim().toUpperCase() === currentSlugline.trim().toUpperCase()
+      );
+      currentSceneRoster = matchingScene ? [...matchingScene.charactersInScene] : [];
+      sceneBeatCount = 0;
+    } else if (el.type === 'action' || el.type === 'shot') {
+      if (currentDialogue.length > 0 || currentAction.length >= 2) {
+        flushBeat();
+      }
+      currentAction.push(el.text);
+    } else if (el.type === 'character') {
+      if (currentDialogue.length > 0) {
+        flushBeat();
+      }
+      currentCharacter = el.text.toUpperCase();
+    } else if (el.type === 'parenthetical') {
+      currentParen = el.text;
+    } else if (el.type === 'dialogue') {
+      currentDialogue.push(el.text);
+      flushBeat();
+    }
+  }
+  flushBeat();
+
+  return panels;
 }
 
 /**

@@ -24,7 +24,7 @@ async function startServer() {
   const app = express();
   const PORT = 3000;
 
-  app.use(express.json({ limit: '15mb' }));
+  app.use(express.json({ limit: '50mb' }));
 
   // 1. Parse Screenplay into Fundamental Technical Storyboard Panels
   app.post('/api/storyboard/parse', async (req, res) => {
@@ -41,14 +41,26 @@ async function startServer() {
         ? `Create approximately ${targetPanelCount} sequential storyboard panels.`
         : 'Create between 4 and 8 sequential storyboard panels covering the fundamental spatial and camera beats.';
 
-      const structuredContext =
+      // Cap script text and structured elements so full-length 120-page .fadein feature drafts never exceed request limits
+      const MAX_SCRIPT_CHARS = 28000;
+      const boundedScriptText =
+        scriptText.length > MAX_SCRIPT_CHARS
+          ? scriptText.slice(0, MAX_SCRIPT_CHARS) + '\n\n[...Excerpt truncated for storyboard batch breakdown...]'
+          : scriptText;
+
+      const boundedElements =
         Array.isArray(scriptElements) && scriptElements.length > 0
-          ? `\n\nStructured Fade In Open Screenplay Format Elements (JSON):\n${JSON.stringify(
-              scriptElements.map((e: any) => ({
-                type: e.type,
-                sceneNumber: e.sceneNumber,
-                text: e.text,
-              })),
+          ? scriptElements.slice(0, 180).map((e: any) => ({
+              type: e.type,
+              sceneNumber: e.sceneNumber,
+              text: String(e.text || '').slice(0, 500),
+            }))
+          : [];
+
+      const structuredContext =
+        boundedElements.length > 0
+          ? `\n\nStructured Fade In Open Screenplay Format Elements (JSON sample):\n${JSON.stringify(
+              boundedElements,
               null,
               2
             )}`
@@ -56,7 +68,7 @@ async function startServer() {
 
       const response = await ai.models.generateContent({
         model: 'gemini-4-hydrogen',
-        contents: `Break down the following Fade In screenplay into sequential technical storyboard panels focusing strictly on fundamental storyboard mechanics: basic character mannequin outlines, spatial room/environment geometry, camera movement vectors, and rule-of-thirds composition.\n\nDrafting Mode: ${draftingMode || 'Technical Wireframe & Camera Vectors'}\n${countDirective}\n\nFormatted Screenplay Text:\n${scriptText}${structuredContext}`,
+        contents: `Break down the following Fade In screenplay into sequential technical storyboard panels focusing strictly on fundamental storyboard mechanics: basic character mannequin outlines, spatial room/environment geometry, camera movement vectors, and rule-of-thirds composition.\n\nDrafting Mode: ${draftingMode || 'Technical Wireframe & Camera Vectors'}\n${countDirective}\n\nFormatted Screenplay Text:\n${boundedScriptText}${structuredContext}`,
         config: {
           systemInstruction: `You are a technical film storyboard draftsman and layout supervisor working with Fade In (.fadein / Open Screenplay Format) scripts.
 Do NOT perform artistic, atmospheric, or stylistic interpretation of the screenplay (avoid mood lighting adjectives, painterly shading, color palettes, or decorative illustration).
@@ -130,6 +142,22 @@ For each panel:
                       type: Type.STRING,
                       description: 'One of: "static", "push_in", "pull_out", "pan_left", "pan_right", "tilt_up", "tilt_down", "track_lateral"',
                     },
+                    subjectLabel: {
+                      type: Type.STRING,
+                      description: 'Primary character name in frame from screenplay (e.g. "VANCE")',
+                    },
+                    secondarySubjectLabel: {
+                      type: Type.STRING,
+                      description: 'Secondary character name in frame for two-shots or OTS (or empty string)',
+                    },
+                    secondarySubjectZone: {
+                      type: Type.STRING,
+                      description: 'One of: "none", "left_third", "center", "right_third", "foreground_ots_left", "foreground_ots_right"',
+                    },
+                    depthArrangement: {
+                      type: Type.STRING,
+                      description: 'One of: "single_midground", "fg_to_mg_conversational", "mg_to_bg_deep_focus", "lateral_two_shot"',
+                    },
                   },
                   required: [
                     'environmentType',
@@ -143,6 +171,10 @@ For each panel:
                     'subjectGridZone',
                     'subjectMotionDirection',
                     'cameraMotionVector',
+                    'subjectLabel',
+                    'secondarySubjectLabel',
+                    'secondarySubjectZone',
+                    'depthArrangement',
                   ],
                 },
               },
@@ -166,7 +198,15 @@ For each panel:
         },
       });
 
-      const rawText = (response.text ?? '[]').trim();
+      let rawText = (response.text ?? '[]').trim();
+      // Strip optional markdown code fences if present
+      rawText = rawText.replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/i, '').trim();
+      const firstBracket = rawText.indexOf('[');
+      const lastBracket = rawText.lastIndexOf(']');
+      if (firstBracket !== -1 && lastBracket > firstBracket) {
+        rawText = rawText.slice(firstBracket, lastBracket + 1);
+      }
+
       const panels = JSON.parse(rawText);
       return res.json({ panels });
     } catch (error: any) {
